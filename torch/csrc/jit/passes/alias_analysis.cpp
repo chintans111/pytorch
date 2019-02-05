@@ -11,6 +11,7 @@ bool shouldAnnotate(const TypePtr& type) {
       type->kind() == TypeKind::ListType ||
       type->kind() == TypeKind::TupleType ||
       type->kind() == TypeKind::DictType || type->kind() == TypeKind::VarType ||
+      type->kind() == TypeKind::FutureType ||
       (type->kind() == TypeKind::OptionalType &&
        shouldAnnotate(type->cast<OptionalType>()->getElementType()));
 }
@@ -19,6 +20,42 @@ bool shouldAnnotate(const TypePtr& type) {
 // mutable types.
 bool shouldAnnotate(const Value* v) {
   return shouldAnnotate(v->type());
+}
+
+std::unordered_set<Node*> getMatchingWaits(Value* fut) {
+  std::unordered_set<Node*> ret;
+
+  // Collect all uses of the future.
+  for (const auto& use : fut->uses()) {
+    const auto user = use.user;
+
+    // If the user is a `wait`, add it to the return set
+    if (user->kind() == aten::wait) {
+      ret.insert(user);
+
+      // Otherwise, it is being passed through a block return and we need to
+      // find the corresponding value in the outer node
+      // e.g.:
+      //   %fut.1 : Future[T] = prim::if(...) {
+      //     %fut : Future[T] = prim::fork(%subgraph)
+      //     -> (%fut)
+      //   }
+      //
+      // We need to now find `fut.1`s corresponding wait.
+    } else if (user->kind() == prim::Return) {
+      const auto outerNode = user->owningBlock()->owningNode();
+      AT_ASSERT(outerNode);
+
+      const auto outerFut = outerNode->outputs().at(use.offset);
+      AT_ASSERT(outerFut->type()->kind() == TypeKind::FutureType);
+      const auto outerWaits = getMatchingWaits(outerFut);
+      ret.insert(outerWaits.cbegin(), outerWaits.cend());
+    } else {
+      fut->node()->owningGraph()->dump();
+      AT_ASSERTM(false, "Unexpected node using a future");
+    }
+  }
+  return ret;
 }
 } // namespace
 
@@ -116,10 +153,7 @@ void AliasDb::getWritesImpl(Block* b, ValueSet& ret, bool recurseBlocks) const {
   }
 }
 
-void AliasDb::getWritesImpl(
-    Node* n,
-    ValueSet& ret,
-    bool recurseBlocks) const {
+void AliasDb::getWritesImpl(Node* n, ValueSet& ret, bool recurseBlocks) const {
   for (const auto input : n->inputs()) {
     if (writesTo(n, input)) {
       ret.insert(input);
@@ -139,7 +173,7 @@ void AliasDb::getWritesImpl(
 }
 
 // Get all writes by all nodes in a block, recursively exploring sub-blocks
-std::unordered_set<const Value*> AliasDb::getWrites(Block* b) const {
+ValueSet AliasDb::getWrites(Block* b) const {
   ValueSet writes;
   getWritesImpl(b, writes, /*recurseBlocks=*/true);
   return writes;
@@ -504,11 +538,9 @@ void AliasDb::analyzeChunk(Node* node) {
   }
 }
 
-void AliasDb::analyzeWait(Node* node) {
-  // Do nothing, this node should have already been analyzed by the
-  // corresponding analyzeFork(). See that function for details.
-}
-
+// Propagate aliasing and write information from the subgraph outputs to the
+// outputs of the corresponding aten::wait() calls, since that's where the
+// values will eventually emerge.
 void AliasDb::analyzeFork(Node* node) {
   const auto subgraph = node->g(attr::Subgraph).get();
   subgraphToOwner_.insert({subgraph, node});
@@ -517,17 +549,32 @@ void AliasDb::analyzeFork(Node* node) {
   mapAliases(subgraphBlock->inputs(), node->inputs());
   analyze(subgraphBlock);
 
-  // Propagate aliasing and write information from the subgraph outputs to the
-  // outputs of the corresponding aten::wait() calls, since that's where the
-  // values will eventually emerge.
-  const auto fut = node->output();
-  const auto subgraphWrites = getWrites(subgraph->block());
-  for (const auto& use : fut->uses()) {
-    const auto wait = use.user;
-    AT_ASSERT(wait->outputs().size() == subgraph->outputs().size());
+  // Give the future that the fork emits a fresh value
+  for (const auto output : node->outputs()) {
+    giveFreshAlias(output);
+  }
+}
 
-    // Propagate aliasing info.
-    mapAliases(wait->outputs(), subgraph->outputs());
+void AliasDb::analyzeWait(Node* node) {
+  const auto fut = node->input();
+  AT_ASSERT(fut->type()->kind() == TypeKind::FutureType);
+
+  if (aliasTracker_->isWildcard(fut)) {
+    for (const auto output : node->outputs()) {
+      aliasTracker_->setWildcard(output);
+    }
+    return;
+  }
+
+  const auto originFuts = aliasTracker_->getMemoryLocations(fut);
+  for (const auto originFut : originFuts) {
+    const auto subgraphNode = originFut->node();
+
+    const auto subgraph = subgraphNode->g(attr::Subgraph).get();
+    const auto subgraphWrites = getWrites(subgraph->block());
+
+    // Retrieve aliasing info from the subgraph
+    mapAliases(node->outputs(), subgraph->outputs());
 
     // Propagate write information to the `wait` node.
     //
@@ -552,7 +599,7 @@ void AliasDb::analyzeFork(Node* node) {
     // since the writes may or may not have been executed yet. But we'll let
     // users do that and shoot themselves in the foot for now.
     for (const auto write : subgraphWrites) {
-      aliasTracker_->registerWrite(write, wait);
+      aliasTracker_->registerWrite(write, node);
     }
   }
 }
